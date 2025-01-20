@@ -62,7 +62,7 @@ void waitfg(pid_t pid);
 void sigchld_handler(int sig);
 void sigtstp_handler(int sig);
 void sigint_handler(int sig);
-int str_match(const char* text, const char* substr, int text_len, int substr_len);
+int str_match(const char* text, const char* substr);
 
 /* Here are helper routines that we've provided for you */
 int parseline(const char *cmdline, char **argv); 
@@ -178,28 +178,39 @@ void eval(char *cmdline)
     }
 
     char* cmd = argv[0];
-    int cmd_len = strlen(argv[0]);
-    if (str_match(cmd, "jobs", cmd_len, 4)) {
+    if (str_match(cmd, "jobs")) {
 	listjobs(jobs);
-    } else if (str_match(cmd, "quit", cmd_len, 4)) {
+    } else if (str_match(cmd, "quit")) {
 	clearjob(jobs);
-	if (errno > 0) unix_error("cannot clear jobs");
+	if (errno > 0) unix_error("cannot clear jobs \n");
 	exit(0);
-    } else if (str_match(cmd, "bg", cmd_len, 2)) {
+    } else if (str_match(cmd, "bg")) {
 	if (argc == 1) {
 	   printf("bg requires job id or process id \n");
 	   return;
 	}
-    } else if (str_match(cmd, "fg", cmd_len, 2)) {
+    } else if (str_match(cmd, "fg")) {
 	if (argc == 1) {
 	   printf("fg requires job id or process id \n");
 	   return;
 	}
-    } else if (str_match(cmd, "/bin/", cmd_len, 5)){
-	printf("cmd: \n");
+    } else if (str_match(cmd, "/bin/")){
+	sigset_t mask, prev;
+	int prev_errno = errno;
 	int pid = builtin_cmd(argv);
+	if (sigfillset(&mask) < 0) unix_error("unable to fill signal set");
+	if (sigprocmask(SIG_BLOCK, &mask, &prev) < 0) unix_error("unable to block signal");
 	if (pid > 0) {
-	    addjob(jobs, pid, is_bg ? BG: FG, argv[0]);
+	    if (!is_bg) {
+		addjob(jobs, pid, FG, argv[0]);
+		if (sigprocmask(SIG_SETMASK, &prev, NULL) < 0) unix_error("unable to restore signal state");
+		errno = prev_errno;
+		waitfg(pid);
+	    } else {
+		addjob(jobs, pid, BG, argv[0]);
+		if (sigprocmask(SIG_SETMASK, &prev, NULL) < 0) unix_error("unable to restore signal state");
+		errno = prev_errno;
+	    }
 	}
     } else {
 	printf("Cmd: %s not found \n", argv[0]);
@@ -208,8 +219,10 @@ void eval(char *cmdline)
     return;
 }
 
-int str_match(const char* text, const char* substr, int text_len, int substr_len)
+int str_match(const char* text, const char* substr)
 {
+    int text_len = strlen(text);
+    int substr_len = strlen(substr);
     if (substr_len > text_len) return 0;
     int i;
     for (i = 0; i < substr_len; i++) {
@@ -282,15 +295,21 @@ int parseline(const char *cmdline, char **argv)
 int builtin_cmd(char **argv) 
 {
     pid_t pid;
+    sigset_t mask, prev;
+    if (sigaddset(&mask, SIGCHLD) < 0) unix_error("unable to fill signal set");
+    if (sigprocmask(SIG_BLOCK, &mask, &prev) < 0) unix_error("unable to fill signal set");
     if ((pid = fork()) == 0) {
+	if (sigprocmask(SIG_SETMASK, &prev, NULL) < 0) unix_error("unable to unblock SIGCHLD");
 	if (execve(argv[0], argv, NULL) < 0) {
 	    unix_error("unable to run program");
 	    return 0;     /* not a builtin command */
 	}
     } else if (pid < 0) {
+	if (sigprocmask(SIG_SETMASK, &prev, NULL) < 0) unix_error("unable to unblock SIGCHLD");
 	unix_error("unable to fork process");
 	return 0;
     } else {
+	if (sigprocmask(SIG_SETMASK, &prev, NULL) < 0) unix_error("unable to unblock SIGCHLD");
 	return pid;
     }
     return 0;     /* not a builtin command */
@@ -301,6 +320,33 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {
+    int fg = str_match(argv[0], "fg");
+    int bg = str_match(argv[0], "bg");
+    char* endptr;
+    int prev_errno = errno;
+    errno = 0;
+    int id = strtol(argv[1], &endptr, 10);
+    if (errno) unix_error("unable to parse id");
+    errno = prev_errno;
+    struct job_t* job;
+    job = getjobpid(jobs, id);
+    if (job == NULL) {
+	job = getjobjid(jobs, id);
+    }
+    if (job == NULL) {
+	printf("Job does not exit for id: %d", id);
+	return;
+    }
+    if (fg) {
+	int pid;
+	if ((pid = builtin_cmd(job->cmdline)) < 0) unix_error("cannot re-exeucte command")
+	job->state = FG;
+	waitfg(pid);
+    } else if (bg) {
+	int pid;
+	if ((pid = builtin_cmd(job->cmdline)) < 0) unix_error("cannot re-exeucte command")
+	job->state = BG;
+    }
     return;
 }
 
@@ -309,6 +355,7 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
+    while (pid == fgpid(jobs)) sleep(1);
     return;
 }
 
@@ -325,6 +372,15 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
+    pid_t pid;
+    int status;
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+	if (WIFEXITED(status)) {
+	    deletejob(jobs, pid);
+	} else {
+	    unix_error("unable to reap process");
+	}
+    }
     return;
 }
 
@@ -499,7 +555,7 @@ void listjobs(struct job_t *jobs)
 		    printf("listjobs: Internal error: job[%d].state=%d ", 
 			   i, jobs[i].state);
 	    }
-	    printf("%s", jobs[i].cmdline);
+	    printf("%s \n", jobs[i].cmdline);
 	}
     }
 }
