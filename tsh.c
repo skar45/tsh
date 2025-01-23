@@ -176,25 +176,26 @@ void eval(char *cmdline)
 	}
 	argc++;
     }
-
+    if (argc == 0) return;
     char* cmd = argv[0];
     if (str_match(cmd, "jobs")) {
 	listjobs(jobs);
     } else if (str_match(cmd, "quit")) {
 	clearjob(jobs);
-	if (errno > 0) unix_error("cannot clear jobs \n");
 	exit(0);
     } else if (str_match(cmd, "bg")) {
 	if (argc == 1) {
 	   printf("bg requires job id or process id \n");
 	   return;
 	}
+	do_bgfg(argv);
     } else if (str_match(cmd, "fg")) {
 	if (argc == 1) {
 	   printf("fg requires job id or process id \n");
 	   return;
 	}
-    } else if (str_match(cmd, "/bin/")){
+	do_bgfg(argv);
+    } else if (str_match(cmd, "/bin/") || str_match(cmd, "./")){
 	sigset_t mask, prev;
 	int prev_errno = errno;
 	int pid = builtin_cmd(argv);
@@ -213,7 +214,7 @@ void eval(char *cmdline)
 	    }
 	}
     } else {
-	printf("Cmd: %s not found \n", argv[0]);
+	printf("%s: Command not found \n", argv[0]);
     }
 
     return;
@@ -299,10 +300,12 @@ int builtin_cmd(char **argv)
     if (sigaddset(&mask, SIGCHLD) < 0) unix_error("unable to fill signal set");
     if (sigprocmask(SIG_BLOCK, &mask, &prev) < 0) unix_error("unable to fill signal set");
     if ((pid = fork()) == 0) {
+	if (setpgid(0, 0) < 0) unix_error("unable to set forked pid as pgid");
 	if (sigprocmask(SIG_SETMASK, &prev, NULL) < 0) unix_error("unable to unblock SIGCHLD");
 	if (execve(argv[0], argv, NULL) < 0) {
-	    unix_error("unable to run program");
-	    return 0;     /* not a builtin command */
+	    printf("%s: Command not found \n", argv[0]);
+	    exit(0);
+	    return 0;
 	}
     } else if (pid < 0) {
 	if (sigprocmask(SIG_SETMASK, &prev, NULL) < 0) unix_error("unable to unblock SIGCHLD");
@@ -312,7 +315,7 @@ int builtin_cmd(char **argv)
 	if (sigprocmask(SIG_SETMASK, &prev, NULL) < 0) unix_error("unable to unblock SIGCHLD");
 	return pid;
     }
-    return 0;     /* not a builtin command */
+    return 0;
 }
 
 /* 
@@ -322,29 +325,35 @@ void do_bgfg(char **argv)
 {
     int fg = str_match(argv[0], "fg");
     int bg = str_match(argv[0], "bg");
+
     char* endptr;
     int prev_errno = errno;
-    errno = 0;
-    int id = strtol(argv[1], &endptr, 10);
-    if (errno) unix_error("unable to parse id");
-    errno = prev_errno;
     struct job_t* job;
-    job = getjobpid(jobs, id);
-    if (job == NULL) {
+    if (argv[1][0] == '%') {
+	errno = 0;
+	int id = strtol(argv[1] + 1, &endptr, 10);
+	if (errno) unix_error("unable to parse id");
+	errno = prev_errno;
 	job = getjobjid(jobs, id);
+    } else {
+	errno = 0;
+	int id = strtol(argv[1], &endptr, 10);
+	if (errno) unix_error("unable to parse id");
+	errno = prev_errno;
+	job = getjobpid(jobs, id);
     }
+
     if (job == NULL) {
-	printf("Job does not exit for id: %d", id);
+	printf("Job does not exit for id: %s\n", argv[1]);
 	return;
     }
+    if (job->state == ST) {
+	if (kill(job->pid, SIGCONT) < 0) unix_error("unable to continue stopped process");
+    }
     if (fg) {
-	int pid;
-	if ((pid = builtin_cmd(job->cmdline)) < 0) unix_error("cannot re-exeucte command")
 	job->state = FG;
-	waitfg(pid);
+	waitfg(job->pid);
     } else if (bg) {
-	int pid;
-	if ((pid = builtin_cmd(job->cmdline)) < 0) unix_error("cannot re-exeucte command")
 	job->state = BG;
     }
     return;
@@ -355,7 +364,11 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
-    while (pid == fgpid(jobs)) sleep(1);
+    sigset_t mask;
+    sigemptyset(&mask);
+    while (pid == fgpid(jobs)){
+	sigsuspend(&mask);
+    };
     return;
 }
 
@@ -375,8 +388,11 @@ void sigchld_handler(int sig)
     pid_t pid;
     int status;
     while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
-	if (WIFEXITED(status)) {
+	if (WIFEXITED(status) || WIFSIGNALED(status)) {
 	    deletejob(jobs, pid);
+	} else if (WIFSTOPPED(status)) {
+	    struct job_t* job = getjobpid(jobs, pid);
+	    job->state = ST;
 	} else {
 	    unix_error("unable to reap process");
 	}
@@ -391,7 +407,11 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
-    exit(0);
+    pid_t pid = fgpid(jobs);
+    if (pid == 0) _exit(0);
+    struct job_t* job = getjobpid(jobs, pid);
+    printf("Job [%d] (%d) terminated by signal %d\n", job->jid, job->pid, sig);
+    if (kill(-pid, SIGINT) < 0) unix_error("unable to terminate child process");
     return;
 }
 
@@ -402,6 +422,11 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+    pid_t pid = fgpid(jobs);
+    if (pid == 0) return;
+    struct job_t* job = getjobpid(jobs, pid);
+    printf("Job [%d] (%d) stopped by signal %d\n", job->jid, job->pid, sig);
+    if (kill(-pid, SIGTSTP) < 0) unix_error("unable to stop foreground process");
     return;
 }
 
